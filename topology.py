@@ -35,33 +35,31 @@ def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
 def safe_get(d, *keys):
     """
-    Πλοήγηση σε nested dicts/lists με λίγη «ελαστικότητα».
-    - Αν συναντήσει λίστα, θα προσπαθήσει να πάρει το πρώτο dict στοιχείο.
+    Πλοήγηση σε nested dicts/lists με ελαστικότητα.
+    - Αν συναντήσει λίστα, θα προσπαθήσει να πάρει το πρώτο dict στοιχείο
+      ή στοιχείο που περιέχει το επόμενο κλειδί.
     """
     cur = d
     for k in keys:
         if cur is None:
             return None
 
-        # Αν είναι λίστα, διάλεξε 1ο λογικό στοιχείο
+        # Αν είναι λίστα
         if isinstance(cur, list):
-            # αν το k είναι int και εντός ορίων, πάμε απευθείας
             if isinstance(k, int) and 0 <= k < len(cur):
                 cur = cur[k]
                 continue
-            # αλλιώς προσπάθησε να βρεις dict που έχει το κλειδί k
             found = None
             for item in cur:
-                if isinstance(item, dict) and ((isinstance(k, str) and k in item) or not isinstance(k, str)):
+                if isinstance(item, dict) and (isinstance(k, str) and k in item):
                     found = item
                     break
             if found is not None:
                 cur = found
             else:
-                # αν δεν βρέθηκε, πάρε το πρώτο στοιχείο
                 cur = cur[0] if cur else None
 
-        # Κανονική πρόσβαση σε dict
+        # Αν είναι dict
         if isinstance(cur, dict):
             if isinstance(k, str):
                 if k in cur:
@@ -69,12 +67,9 @@ def safe_get(d, *keys):
                 else:
                     return None
             else:
-                # αν ζητάμε index σε dict, δεν γίνεται
                 return None
         else:
-            # ούτε dict ούτε list πλέον
             if k is not None:
-                # δεν μπορούμε να κατέβουμε άλλο
                 return None
     return cur
 
@@ -93,10 +88,6 @@ def detect_root(data):
     raise KeyError("Δεν βρέθηκε Data.Sub στη δομή του MAT")
 
 def _normalize_sub_char(sub_char):
-    """
-    Επιστρέφει ένα dict με τα χαρακτηριστικά του συμμετέχοντα ή None.
-    Υποστηρίζει περιπτώσεις όπου sub_char είναι λίστα ή dict.
-    """
     if sub_char is None:
         return None
     if isinstance(sub_char, dict):
@@ -109,10 +100,6 @@ def _normalize_sub_char(sub_char):
     return None
 
 def is_stroke_subject(sub_char):
-    """
-    Επιστρέφει True αν φαίνεται να είναι συμμετέχων με εγκεφαλικό.
-    sub_char μπορεί να είναι dict ή λίστα.
-    """
     sc = _normalize_sub_char(sub_char)
     if not isinstance(sc, dict):
         return False
@@ -125,54 +112,91 @@ def get_lesion_left(sub_char):
         return sc['LesionLeft']
     return None
 
+# ------------------------------------------------------------
+# 3) Εντοπισμός side blocks (robust)
+# ------------------------------------------------------------
 def get_side_blocks(sub, stroke=False):
     """
     Επιστρέφει dict με δεδομένα ανά πλευρά.
     Υγιείς: 'L'/'R'
     Stroke: 'P'/'N' (paretic/non-paretic)
+
+    Υποστηρίζει πολλά aliases:
+    - Able-bodied: Lsegmented_Ldata / Rsegmented_Rdata  ή  Lsegm_Ldata / Rsegm_Rdata
+    - Stroke (εναλλακτικές του αρχείου που είδες):
+        PsideSegm_PsideData / NsideSegm_NsideData (κύρια)
+      και επίσης:
+        Psegmented_Pdata / Nsegmented_Ndata
+        Psegm_Pdata      / Nsegm_Ndata
     """
     if not stroke:
-        return {
-            'L': safe_get(sub, 'Lsegmented_Ldata'),
-            'R': safe_get(sub, 'Rsegmented_Rdata')
-        }
+        cand_maps = [
+            ('L','Lsegmented_Ldata'), ('R','Rsegmented_Rdata'),
+            ('L','Lsegm_Ldata'),      ('R','Rsegm_Rdata'),
+            # μερικά datasets έχουν LsideSegm_*:
+            ('L','LsideSegm_LsideData'), ('R','RsideSegm_RsideData'),
+        ]
+        out = {'L': None, 'R': None}
     else:
-        return {
-            'P': safe_get(sub, 'Psegmented_Pdata'),
-            'N': safe_get(sub, 'Nsegmented_Ndata')
-        }
+        cand_maps = [
+            # νέα ονόματα που βρήκες
+            ('P','PsideSegm_PsideData'), ('N','NsideSegm_NsideData'),
+            # κλασικά aliases
+            ('P','Psegmented_Pdata'),    ('N','Nsegmented_Ndata'),
+            ('P','Psegm_Pdata'),         ('N','Nsegm_Ndata'),
+            # επιπλέον ασφαλιστικές δικλείδες
+            ('P','PsideSegm_Pdata'),     ('N','NsideSegm_Ndata'),
+        ]
+        out = {'P': None, 'N': None}
+
+    for side, key in cand_maps:
+        if out.get(side) is None and isinstance(sub, dict) and key in sub:
+            out[side] = sub[key]
+    return out
 
 # ------------------------------------------------------------
-# 3) Εξαγωγή κυματομορφών
+# 4) Εξαγωγή κυματομορφών (robust paths)
 # ------------------------------------------------------------
 def extract_waveform(block, kind, comp=None):
     """
     Επιστρέφει dict {kind: array}
-    Προσδοκία σχημάτων: [1001 x n_strides] ή [n_strides x 1001]
+    Δοκιμάζει πολλά paths: flat, 'Kinematic data', 'Kinetic data', 'EMG data'
+    και axis keys σε πεζά/κεφαλαία.
     """
     out = {}
     if block is None:
         return out
 
-    # Κινηματικά (γωνίες)
-    if kind in ['HipAngles','KneeAngles','AnkleAngles']:
-        node = safe_get(block, kind)
-        if isinstance(node, dict) and comp in node:
-            out[kind] = np.asarray(node[comp])
-        return out
+    # Paths που θα δοκιμάσουμε
+    paths = [
+        [kind],                       # flat
+        ['Kinematic data', kind],
+        ['Kinetic data',   kind],
+        ['EMG data',       kind],
+    ]
 
-    # Δυνάμεις εδάφους
-    if kind == 'GroundReactionForce':
-        node = safe_get(block, kind)
-        if isinstance(node, dict) and comp in node:
-            out[kind] = np.asarray(node[comp])
-        return out
-
-    # EMG (normalized)
-    if kind in ['GASnorm','RFnorm','VLnorm','BFnorm','STnorm','TAnorm','ERSnorm']:
-        node = safe_get(block, kind)
+    node = None
+    for p in paths:
+        node = safe_get(block, *p)
         if node is not None:
+            break
+    if node is None:
+        return out
+
+    # 3D components (angles/GRF) ή EMG (array)
+    if kind in ['HipAngles','KneeAngles','AnkleAngles','GroundReactionForce']:
+        axis = comp or 'x'
+        for key_try in [axis, axis.upper(), axis.lower()]:
+            if isinstance(node, dict) and key_try in node:
+                out[kind] = np.asarray(node[key_try])
+                return out
+        # Αν δεν υπάρχουν άξονες (μερικές περιπτώσεις)
+        if isinstance(node, (np.ndarray, list)):
             out[kind] = np.asarray(node)
+            return out
+    else:
+        # EMG arrays (π.χ. GASnorm)
+        out[kind] = np.asarray(node)
         return out
 
     return out
@@ -183,17 +207,15 @@ def mean_curve(arr):
     arr = np.asarray(arr)
     if arr.ndim == 1:
         return arr
-    # [1001 x n_strides] ή [n_strides x 1001]
     if arr.shape[0] == 1001:
         return np.nanmean(arr, axis=1)
     if arr.shape[1] == 1001:
         return np.nanmean(arr, axis=0)
-    # fallback
     ax = 1 if arr.shape[1] > 1 else 0
     return np.nanmean(arr, axis=ax)
 
 # ------------------------------------------------------------
-# 4) Persistent homology (Ripser)
+# 5) Persistent homology (Ripser)
 # ------------------------------------------------------------
 def takens_embedding(sig, m=8, tau=5):
     sig = np.asarray(sig, dtype=float)
@@ -224,7 +246,7 @@ def save_pd_and_barcode(dgm, out_prefix, title="H1"):
     plt.close()
 
 # ------------------------------------------------------------
-# 5) Εξαγωγή σε CSV και summary
+# 6) Εξαγωγή σε CSV και summary
 # ------------------------------------------------------------
 def save_curve(curve, subject_id, side, varname, out_csv):
     t = np.linspace(0, 100, len(curve))
@@ -294,7 +316,7 @@ def process_subject(sub, subj_index, outdir, stroke=False, lesion_left=None):
         pd.DataFrame(results).to_csv(os.path.join(outdir, f"sub{subj_index:03d}_summary.csv"), index=False)
 
 # ------------------------------------------------------------
-# 6) Κύρια συνάρτηση
+# 7) Κύρια συνάρτηση
 # ------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -306,7 +328,7 @@ def main():
     ensure_dir(args.out)
     data_raw = load_mat_any(args.mat)
     root = detect_root(data_raw)
-    subs = root['Sub']
+    subs = root['Sub'] if 'Sub' in root else root.get('Sub')
 
     def looks_like_single_subject(d):
         if not isinstance(d, dict):
@@ -316,7 +338,10 @@ def main():
             'sub_char', 'meas_char', 'events',
             'Lsegmented_Ldata', 'Rsegmented_Rdata',
             'Psegmented_Pdata', 'Nsegmented_Ndata',
-            'Lsegmented_Bdata', 'Rsegmented_Bdata'
+            'Lsegmented_Bdata', 'Rsegmented_Bdata',
+            # νέα που βρήκες:
+            'PsideSegm_PsideData','PsideSegm_NsideData','PsideSegm_BsideData',
+            'NsideSegm_PsideData','NsideSegm_NsideData','NsideSegm_BsideData'
         }
         return len(keys & sentinels) > 0
 
