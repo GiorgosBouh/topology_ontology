@@ -44,14 +44,23 @@ def safe_get(d, *keys):
     return cur
 
 def detect_root(data):
-    """Βρίσκει πού είναι το Data.Sub μέσα στο struct"""
-    if 'Data' in data and isinstance(data['Data'], dict) and 'Sub' in data['Data']:
+    """
+    Επιστρέφει ένα dict που έχει κλειδί 'Sub' με είτε:
+      - list of subjects, ή
+      - dict με numeric keys, ή
+      - dict ενός ΜΟΝΟ subject (θα το τυλίξουμε σε λίστα αργότερα)
+    """
+    # case 1: κλασικό Data -> Sub
+    if isinstance(data, dict) and 'Data' in data and isinstance(data['Data'], dict) and 'Sub' in data['Data']:
         return data['Data']
-    if 'Sub' in data:
+    # case 2: επίπεδο με Sub δίπλα
+    if isinstance(data, dict) and 'Sub' in data:
         return data
-    for k,v in data.items():
-        if isinstance(v, dict) and 'Sub' in v:
-            return v
+    # case 3: σάρωσε για nested αντικείμενο που περιέχει Sub
+    if isinstance(data, dict):
+        for k, v in data.items():
+            if isinstance(v, dict) and 'Sub' in v:
+                return v
     raise KeyError("Δεν βρέθηκε Data.Sub στη δομή του MAT")
 
 def is_stroke_subject(sub_char):
@@ -195,16 +204,52 @@ def main():
     data_raw = load_mat_any(args.mat)
     root = detect_root(data_raw)
     subs = root['Sub']
-    if isinstance(subs, dict):
-        ids = sorted([int(k) for k in subs.keys()])
-        iterable = [(i, subs[str(i)]) for i in ids]
+
+    def looks_like_single_subject(d):
+        if not isinstance(d, dict): 
+            return False
+        keys = set(d.keys())
+        sentinels = {'sub_char','meas_char','events',
+                     'Lsegmented_Ldata','Rsegmented_Rdata',
+                     'Psegmented_Pdata','Nsegmented_Ndata',
+                     'Lsegmented_Bdata','Rsegmented_Bdata',
+                     'Nsegm_Pdata','Nsegm_Ndata','Psegm_Pdata','Psegm_Ndata'}
+        return len(keys & sentinels) > 0
+
+    # Κανονικοποίηση σε "λίστα από (index, subject_dict)"
+    if isinstance(subs, list):
+        all_subjects = list(enumerate(subs, start=1))
+    elif isinstance(subs, dict):
+        # περίπτωση: numeric keys ('1','2',...) -> πολλοί subjects
+        numeric_keys = [k for k in subs.keys() if str(k).isdigit()]
+        if numeric_keys:
+            idxs = sorted(int(k) for k in numeric_keys)
+            all_subjects = [(i, subs[str(i)]) for i in idxs]
+        else:
+            # περίπτωση: ΜΟΝΟ ΕΝΑΣ subject (dict με sub_char κτλ.)
+            if looks_like_single_subject(subs):
+                all_subjects = [(1, subs)]
+            else:
+                # τελευταία άμυνα: δοκίμασε να συγκεντρώσεις ό,τι μοιάζει με subject
+                candidates = []
+                for k, v in subs.items():
+                    if looks_like_single_subject(v):
+                        try:
+                            i = int(k)
+                        except:
+                            continue
+                        candidates.append((i, v))
+                if not candidates:
+                    raise ValueError("Δεν μπορώ να ερμηνεύσω το 'Sub' ως λίστα/σύνολο συμμετεχόντων.")
+                all_subjects = sorted(candidates, key=lambda x: x[0])
     else:
-        iterable = list(enumerate(subs, start=1))
+        raise TypeError("Άγνωστος τύπος για Sub")
 
+    # Φιλτράρισμα για --subject
     if args.subject is not None:
-        iterable = [x for x in iterable if x[0]==args.subject]
+        all_subjects = [pair for pair in all_subjects if pair[0] == args.subject]
 
-    for idx, sub in iterable:
+    for idx, sub in all_subjects:
         sub_char = safe_get(sub,'sub_char')
         stroke = is_stroke_subject(sub_char)
         lesion_left = safe_get(sub_char,'LesionLeft') if stroke else None
@@ -212,9 +257,6 @@ def main():
         ensure_dir(outdir)
         print(f"[INFO] Processing subject {idx} | stroke={stroke} | lesion_left={lesion_left}")
         process_subject(sub, idx, outdir, stroke=stroke, lesion_left=lesion_left)
-
-    print("[DONE] Αποτελέσματα στον φάκελο:", os.path.abspath(args.out))
-
 # ------------------------------------------------------------
 if __name__ == '__main__':
     main()
