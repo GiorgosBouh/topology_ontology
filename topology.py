@@ -5,15 +5,20 @@ topology.py
 ------------------------------------------
 Φόρτωση .MAT (Able-bodied ή Post-Stroke),
 εξαγωγή L/R ή P/N κυματομορφών,
+φιλτράρισμα GRF με GoodLanding ή threshold,
 και υπολογισμός persistent homology (barcodes & H1 diagrams).
 
 Χρήση:
   python topology.py --mat /path/to/MAT_normalizedData_*.mat --subject 1 --out output
 """
 
-import argparse, os, math
+import argparse, os, math, warnings
 import numpy as np
 import pandas as pd
+
+# Καταστολή άσχετων warnings (π.χ. Mean of empty slice)
+warnings.filterwarnings("ignore", message="Mean of empty slice")
+
 
 # ------------------------------------------------------------
 # 1) Φόρτωση MAT (συμβατό και με v7.3 HDF5)
@@ -27,6 +32,7 @@ def load_mat_any(path):
         from scipy.io import loadmat
         print("[INFO] Loading MAT (pre-v7.3) with scipy.io...")
         return loadmat(path, simplify_cells=True)
+
 
 # ------------------------------------------------------------
 # 2) Βοηθητικά
@@ -96,6 +102,7 @@ def get_lesion_left(sub_char):
         return sc['LesionLeft']
     return None
 
+
 # ------------------------------------------------------------
 # 3) Side blocks (με aliases & “δύο καρτέλες” P/N)
 # ------------------------------------------------------------
@@ -126,6 +133,7 @@ def get_side_blocks(sub, stroke=False):
         Pblk = first_dict(sub.get('PsideSegm_PsideData')) or first_dict(sub.get('Psegmented_Pdata') or sub.get('Psegm_Pdata'))
         Nblk = first_dict(sub.get('NsideSegm_NsideData')) or first_dict(sub.get('Nsegmented_Ndata') or sub.get('Nsegm_Ndata'))
         return {'P': Pblk, 'N': Nblk}
+
 
 # ------------------------------------------------------------
 # 4) Μετατροπή οποιασδήποτε δομής σε 2D numeric πίνακα
@@ -161,6 +169,7 @@ def to_numeric_matrix(x):
             return np.stack([r[:L] for r in rows], axis=0)
 
     return None
+
 
 # ------------------------------------------------------------
 # 5) Εξαγωγή κυματομορφών (flat / Kinematic / Kinetic / EMG)
@@ -214,26 +223,76 @@ def extract_waveform(block, kind, comp=None):
         arr = to_numeric_matrix(node)
         return {kind: arr} if arr is not None else {}
 
-# ------------------------------------------------------------
-# 6) Μέση καμπύλη από 2D
-# ------------------------------------------------------------
-def mean_curve(arr2d):
-    """
-    Δέχεται:
-      - (n_strides, 1001) ή (1001, n_strides) ή (1,1001) ή 1D
-    Επιστρέφει 1D καμπύλη.
-    """
-    if arr2d is None: return None
-    A = np.asarray(arr2d)
-    if A.ndim == 0: return None
-    if A.ndim == 1: return A
-    if A.shape[0] == 1001: return np.nanmean(A, axis=1)
-    if A.shape[1] == 1001: return np.nanmean(A, axis=0)
-    ax = 1 if A.shape[1] > 1 else 0
-    return np.nanmean(A, axis=ax)
 
 # ------------------------------------------------------------
-# 7) Persistent homology (Ripser)
+# 6) Stride φίλτρα & μέση καμπύλη
+# ------------------------------------------------------------
+def drop_all_nan_strides(A):
+    """Κράτα μόνο strides που έχουν τουλάχιστον ένα finite sample.
+       Δουλεύει και για (1001, n_strides) και για (n_strides, 1001)."""
+    A = np.asarray(A, dtype=float)
+    if A.ndim != 2:
+        return A, 0
+    if A.shape[0] == 1001:
+        valid = np.isfinite(A).any(axis=0)  # strides = columns
+        return A[:, valid], int(valid.sum())
+    elif A.shape[1] == 1001:
+        valid = np.isfinite(A).any(axis=1)  # strides = rows
+        return A[valid, :], int(valid.sum())
+    else:
+        if np.isfinite(A).any():
+            return A, 1
+        return A, 0
+
+def valid_grf_mask_from_z(grf_z_2d, min_peak_bw=0.1, min_samples_over=5):
+    """
+    grf_z_2d: (1001, n_strides) ή (n_strides, 1001)
+    Επιστρέφει μάσκα (n_strides,) με True όπου ο stride έχει
+    τουλάχιστον 'min_samples_over' δείγματα > min_peak_bw (BW-normalized).
+    """
+    A = np.asarray(grf_z_2d, dtype=float)
+    if A.ndim != 2:
+        return None
+    if A.shape[0] == 1001:
+        over = A > min_peak_bw
+        return (np.sum(over, axis=0) >= min_samples_over)
+    elif A.shape[1] == 1001:
+        over = A > min_peak_bw
+        return (np.sum(over, axis=1) >= min_samples_over)
+    return None
+
+def mean_curve(arr2d):
+    """
+    Επιστρέφει 1D καμπύλη ή None αν δεν υπάρχουν έγκυρα (finite) δείγματα.
+    Δέχεται (n_strides, 1001) ή (1001, n_strides) ή (1,1001) ή 1D.
+    """
+    if arr2d is None:
+        return None
+    A = np.asarray(arr2d, dtype=float)
+    if A.ndim == 0:
+        return None
+    if not np.isfinite(A).any():
+        return None
+    if A.ndim == 1:
+        return A
+
+    if A.shape[0] == 1001:
+        row_mask = np.isfinite(A).any(axis=1)
+        if not row_mask.any():
+            return None
+        return np.nanmean(A, axis=1)
+    if A.shape[1] == 1001:
+        col_mask = np.isfinite(A).any(axis=0)
+        if not col_mask.any():
+            return None
+        return np.nanmean(A, axis=0)
+
+    ax = 1 if (A.ndim >= 2 and A.shape[1] > 1) else 0
+    return np.nanmean(A, axis=ax)
+
+
+# ------------------------------------------------------------
+# 7) Persistence homology (Ripser) & plots
 # ------------------------------------------------------------
 def takens_embedding(sig, m=8, tau=5):
     sig = np.asarray(sig, dtype=float)
@@ -251,20 +310,73 @@ def ripser_h1_diagram(X):
 
 def save_pd_and_barcode(dgm, out_prefix, title="H1"):
     import matplotlib.pyplot as plt
-    from persim import plot_diagrams, plot_barcodes
-    # Diagram
+    # --- Persistence Diagram (πάντα διαθέσιμο) ---
+    from persim import plot_diagrams
     plt.figure()
     plot_diagrams([dgm], show=False, title=f"{title} Persistence Diagram")
     plt.savefig(out_prefix + "_H1diagram.png", dpi=150, bbox_inches='tight')
     plt.close()
-    # Barcode
-    plt.figure()
-    plot_barcodes([dgm], title=f"{title} Barcode")
-    plt.savefig(out_prefix + "_H1barcode.png", dpi=150, bbox_inches='tight')
-    plt.close()
+
+    # --- Barcode: δοκίμασε persim.plot_barcodes, αλλιώς custom ---
+    try:
+        from persim import plot_barcodes
+        plt.figure()
+        plot_barcodes([dgm], title=f"{title} Barcode")
+        plt.savefig(out_prefix + "_H1barcode.png", dpi=150, bbox_inches='tight')
+        plt.close()
+    except Exception:
+        # custom barcode renderer
+        import numpy as np
+        plt.figure()
+        y = 0
+        for bd in np.asarray(dgm):
+            if len(bd) < 2:
+                continue
+            b, de = float(bd[0]), float(bd[1])
+            if np.isfinite(b) and np.isfinite(de) and de > b:
+                plt.hlines(y, b, de)
+                y += 1
+        plt.xlabel("filtration")
+        plt.ylabel("bars")
+        plt.title(f"{title} Barcode (custom)")
+        plt.tight_layout()
+        plt.savefig(out_prefix + "_H1barcode.png", dpi=150, bbox_inches='tight')
+        plt.close()
+
 
 # ------------------------------------------------------------
-# 8) Εξαγωγή σε CSV και summary
+# 8) GoodLanding από events (αν υπάρχει)
+# ------------------------------------------------------------
+def get_goodlanding_mask(sub, side_key):
+    """
+    Προσπαθεί να βρει μάσκα GoodLanding για το αντίστοιχο tab.
+    side_key: 'P' ή 'N' (post-stroke) ή 'L'/'R' (healthy)
+    Επιστρέφει np.array shape (n_strides,) από True/False ή None αν δεν βρεθεί.
+    """
+    ev = sub.get('events')
+    if not isinstance(ev, dict):
+        return None
+
+    candidates = []
+    if side_key == 'P':
+        candidates = ['PsideSegm_GoodLanding', 'P_GoodLanding', 'GoodLanding_P']
+    elif side_key == 'N':
+        candidates = ['NsideSegm_GoodLanding', 'N_GoodLanding', 'GoodLanding_N']
+    elif side_key == 'L':
+        candidates = ['L_GoodLanding', 'GoodLanding_L']
+    elif side_key == 'R':
+        candidates = ['R_GoodLanding', 'GoodLanding_R']
+
+    for ck in candidates:
+        gl = ev.get(ck)
+        if gl is not None:
+            arr = np.asarray(gl).astype(float).reshape(-1)
+            return arr == 1
+    return None
+
+
+# ------------------------------------------------------------
+# 9) Εξαγωγή σε CSV και summary
 # ------------------------------------------------------------
 def save_curve(curve, subject_id, side, varname, out_csv):
     t = np.linspace(0, 100, len(curve))
@@ -300,8 +412,51 @@ def process_subject(sub, subj_index, outdir, stroke=False, lesion_left=None):
             if not waves:
                 continue
             arr2d = list(waves.values())[0]
-            curve = mean_curve(arr2d)
-            if curve is None or np.all(np.isnan(curve)):
+
+            # --- ειδικός χειρισμός για GRF: φίλτραρισμα ανά stride ---
+            if kind == 'GroundReactionForce':
+                # 1) Αν υπάρχει GoodLanding για το tab, φιλτράρισε
+                gl_mask = get_goodlanding_mask(sub, side)
+                if gl_mask is not None:
+                    A = np.asarray(arr2d, dtype=float)
+                    if A.ndim == 2:
+                        if A.shape[0] == 1001 and gl_mask.size == A.shape[1]:
+                            arr2d = A[:, gl_mask]
+                        elif A.shape[1] == 1001 and gl_mask.size == A.shape[0]:
+                            arr2d = A[gl_mask, :]
+                else:
+                    # 2) αλλιώς, threshold στον GRF_z
+                    mask = valid_grf_mask_from_z(arr2d, min_peak_bw=0.1, min_samples_over=5)
+                    if mask is not None:
+                        A = np.asarray(arr2d, dtype=float)
+                        if A.ndim == 2:
+                            if A.shape[0] == 1001 and mask.size == A.shape[1]:
+                                arr2d = A[:, mask]
+                            elif A.shape[1] == 1001 and mask.size == A.shape[0]:
+                                arr2d = A[mask, :]
+
+            # ➊ Πέτα strides που είναι όλοι-NaN
+            arr2d_filt, n_valid = drop_all_nan_strides(arr2d)
+            if n_valid == 0 or not np.isfinite(arr2d_filt).any():
+                results.append({
+                    'subject': subj_index,
+                    'side': side,
+                    'variable': f"{kind}_{comp or 'n'}",
+                    'error': 'empty_or_all_nan',
+                    'lesion_left': int(lesion_left) if lesion_left is not None else None
+                })
+                continue
+
+            # ➋ μέση καμπύλη
+            curve = mean_curve(arr2d_filt)
+            if curve is None or (isinstance(curve, np.ndarray) and not np.isfinite(curve).any()):
+                results.append({
+                    'subject': subj_index,
+                    'side': side,
+                    'variable': f"{kind}_{comp or 'n'}",
+                    'error': 'empty_or_all_nan',
+                    'lesion_left': int(lesion_left) if lesion_left is not None else None
+                })
                 continue
 
             varname = f"{kind}_{comp or 'n'}"
@@ -351,8 +506,9 @@ def process_subject(sub, subj_index, outdir, stroke=False, lesion_left=None):
     if results:
         pd.DataFrame(results).to_csv(os.path.join(outdir, f"sub{subj_index:03d}_summary.csv"), index=False)
 
+
 # ------------------------------------------------------------
-# 9) Κύρια συνάρτηση
+# 10) Κύρια συνάρτηση
 # ------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -422,6 +578,7 @@ def main():
         process_subject(sub, idx, outdir, stroke=stroke, lesion_left=lesion_left)
 
     print("[DONE] Αποτελέσματα στον φάκελο:", os.path.abspath(args.out))
+
 
 # ------------------------------------------------------------
 if __name__ == '__main__':
