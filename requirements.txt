@@ -6,3 +6,4 @@ h5py>=3.10
 ripser>=0.6.6
 persim>=0.3.1
 matplotlib>=3.8
+openpyxl>=3.1
