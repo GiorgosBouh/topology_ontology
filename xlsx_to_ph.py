@@ -3,50 +3,100 @@
 """
 xlsx_to_ph.py
 ------------------------------------------
-Διαβάζει post-processed Excel (xlsx) με stride-normalized δεδομένα
-(ανά καρτέλα/subject), εξάγει καμπύλες (angles/EMG) ανά πλευρά,
-και υπολογίζει persistent homology (H1) με Ripser.
+Διαβάζει τα Excel:
+  - MAT_normalizedData_PostStrokeAdults_v27-02-23.xlsx
+  - MAT_normalizedData_AbleBodiedAdults_v06-03-23.xlsx
 
-Έξοδοι ανά subject:
-- CSV καμπύλες (long format): subject,side,variable,gc_percent,value
-- PNG: *_H1diagram.png, *_H1barcode.png
-- subXXX_summary.csv
-Επίσης στο root: all_subjects_summary.csv
+Parser robust:
+  • Σκανάρει ΚΑΘΕ SHEET (ένας συμμετέχων)
+  • Δουλεύει σε wide-rows μορφή: 1η στήλη = όνομα μεταβλητής, επόμενες ~1001 στήλες = τιμές
+  • Αναγνωρίζει side (L/R ή Left/Right ή P/N για stroke)
+  • Εξάγει καμπύλες (1001 samples), αποθηκεύει CSV, H1 diagram & barcode
+  • Γράφει per-subject summary + merged all_subjects_summary.csv στο τέλος
 
 Χρήση:
-  python xlsx_to_ph.py --xlsx /path/to/file.xlsx --out out_folder --label_prefix post
+  python xlsx_to_ph.py --xlsx /path/to/Excel.xlsx --out output_dir --label_prefix post|healthy
 """
 
-import argparse, os, re, warnings
+import argparse, os, re, math, warnings
 import numpy as np
 import pandas as pd
 
 warnings.filterwarnings("ignore", message="Mean of empty slice")
 
-# -------------------- PH helpers --------------------
+# -------------------- utils --------------------
+
+def ensure_dir(p): os.makedirs(p, exist_ok=True)
+
+def slug(s: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_]+', '_', s or '').strip('_')
+
+def detect_side_from_text(name: str):
+    """Προσπαθεί να εξάγει πλευρά από το όνομα."""
+    n = (name or "").lower()
+    if any(k in n for k in [' left', '(left)', '_left', ' l ', '_l', ' l)', ' left_', 'left-']):
+        return 'L'
+    if any(k in n for k in [' right', '(right)', '_right', ' r ', '_r', ' r)', ' right_', 'right-']):
+        return 'R'
+    if any(k in n for k in ['_p', ' paretic', '(p)', ' p ']):
+        return 'P'
+    if any(k in n for k in ['_n', ' non-paretic', '(n)', ' n ']):
+        return 'N'
+    # fallback: δεν δηλώνεται — επέστρεψε None, θα βάλουμε L/R ανά διπλές εμφανίσεις
+    return None
+
+def detect_variable_from_text(name: str):
+    """
+    Εντοπίζει τύπο μεταβλητής από το κείμενο.
+    Χαλαρό mapping για Hip/Knee/Ankle Angles, GRF, EMG (GAS/RF/VL/BF/ST/TA/ERS).
+    """
+    n = (name or "").lower()
+    # βασικά joint angles
+    if 'hip'   in n and 'angle' in n:   return 'HipAngles_x'
+    if 'knee'  in n and 'angle' in n:   return 'KneeAngles_x'
+    if 'ankle' in n and 'angle' in n:   return 'AnkleAngles_x'
+    # pelvis angle optional
+    if 'pelvis' in n and 'angle' in n:  return 'PelvisAngles_x'
+
+    # GRF
+    if ('grf' in n or 'ground reaction force' in n) and ('z' in n or 'vertical' in n):
+        return 'GroundReactionForce_z'
+
+    # EMG muscles
+    for m in ['gas','rf','vl','bf','st','ta','ers']:
+        if re.search(r'\b'+m+r'\b', n):
+            return m.upper()+'norm'  # normalized channels
+
+    # fallback: δοκίμασε καθαρή λέξη "angle" και hip/knee/ankle αλλιώς
+    if 'angle' in n:
+        if 'hip' in n: return 'HipAngles_x'
+        if 'knee' in n: return 'KneeAngles_x'
+        if 'ankle' in n: return 'AnkleAngles_x'
+
+    return None
+
 def takens_embedding(sig, m=8, tau=5):
     sig = np.asarray(sig, dtype=float).ravel()
-    N = len(sig)
-    L = N - (m - 1) * tau
-    if L <= 0:
-        raise ValueError("Signal too short for Takens (m,tau)")
-    X = np.stack([sig[i:i+L] for i in range(0, m*tau, tau)], axis=1)
-    return X
+    N = len(sig); L = N - (m-1)*tau
+    if L <= 0: return None
+    return np.stack([sig[i:i+L] for i in range(0, m*tau, tau)], axis=1)
 
-def ripser_h1_diagram(X):
+def ripser_h1(X):
+    if X is None:
+        return np.empty((0,2))
     from ripser import ripser
     res = ripser(X, maxdim=1)
-    return res['dgms'][1] if len(res['dgms']) > 1 else np.empty((0, 2))
+    return res['dgms'][1] if len(res['dgms'])>1 else np.empty((0,2))
 
 def save_pd_and_barcode(dgm, out_prefix, title="H1"):
     import matplotlib.pyplot as plt
     from persim import plot_diagrams
-    # Diagram
+    # diagram
     plt.figure()
     plot_diagrams([dgm], show=False, title=f"{title} Persistence Diagram")
     plt.savefig(out_prefix + "_H1diagram.png", dpi=150, bbox_inches='tight')
     plt.close()
-    # Barcode
+    # barcode: persim<=0.4 ίσως δεν έχει plot_barcodes – fallback custom
     try:
         from persim import plot_barcodes
         plt.figure()
@@ -54,7 +104,6 @@ def save_pd_and_barcode(dgm, out_prefix, title="H1"):
         plt.savefig(out_prefix + "_H1barcode.png", dpi=150, bbox_inches='tight')
         plt.close()
     except Exception:
-        # fallback custom
         plt.figure()
         y = 0
         for b, d in np.asarray(dgm):
@@ -67,176 +116,222 @@ def save_pd_and_barcode(dgm, out_prefix, title="H1"):
         plt.savefig(out_prefix + "_H1barcode.png", dpi=150, bbox_inches='tight')
         plt.close()
 
-# -------------------- CSV writer --------------------
-def ensure_dir(p): os.makedirs(p, exist_ok=True)
-
-def save_curve_long(curve, subject_id, side, varname, out_csv):
+def save_curve_csv(curve, subject_id, side, varname, out_csv):
+    import pandas as pd, numpy as np
     t = np.linspace(0, 100, len(curve))
-    df = pd.DataFrame({
-        'subject': subject_id,
-        'side': side,
-        'variable': varname,
-        'gc_percent': t,
-        'value': curve
-    })
+    df = pd.DataFrame({'subject':subject_id,'side':side,'variable':varname,'gc_percent':t,'value':curve})
     df.to_csv(out_csv, index=False)
 
-# -------------------- Column parsing --------------------
-SIDE_PATTERNS = {
-    'L': [r'\bL\b', r'_L\b', r'\.L\b', r'\(L\)', r'Left', r'\bLt\b'],
-    'R': [r'\bR\b', r'_R\b', r'\.R\b', r'\(R\)', r'Right', r'\bRt\b'],
-}
-# ενδιαφέροντα variables
-ANGLE_VARS = ['Hip', 'Knee', 'Ankle', 'Pelvis']  # sagittal μόνο
-EMG_VARS   = ['GAS','RF','VL','BF','ST','TA','ERS']
+# -------------------- row-wise Excel parser --------------------
 
-def detect_side(colname):
-    c = str(colname)
-    for side, pats in SIDE_PATTERNS.items():
-        for pat in pats:
-            if re.search(pat, c, flags=re.IGNORECASE):
-                return side
-    return None  # αν δεν βρεθεί σαφής πλευρά
-
-def normalize_var(colname):
-    """Επιστρέφει standardized variable label ή None αν δεν μας ενδιαφέρει"""
-    c = str(colname)
-    # Angles
-    for base in ANGLE_VARS:
-        if re.search(fr'\b{base}\b', c, flags=re.IGNORECASE):
-            return f"{base}Angles_x"  # sagittal
-    # EMG
-    for m in EMG_VARS:
-        if re.search(fr'\b{m}\b', c, flags=re.IGNORECASE):
-            return f"{m}norm" if re.search(r'norm', c, flags=re.IGNORECASE) else m
-    return None
-
-def is_time_column(name):
-    return str(name).strip().lower() in {'gc_percent','gaitcycle','gait_cycle','time','t','percent'}
-
-def pick_timeseries_columns(df):
+def row_to_numeric_values(row_values):
     """
-    Επιλέγει στήλες που είναι 1D καμπύλες (μήκος ~1001).
-    Φιλτράρει μεταδεδομένα/χρονικές στήλες.
+    Παίρνει μία γραμμή (λίστα τιμών από pandas) και επιστρέφει το ΜΕΓΑΛΥΤΕΡΟ
+    συνεχόμενο μπλοκ από αριθμούς (>=900 τιμές), ως numpy array.
+    Αν δεν βρει, επιστρέφει None.
     """
-    cols = []
-    for c in df.columns:
-        if is_time_column(c): 
-            continue
-        # πετάξει προφανώς μη-αριθμητικές στήλες/IDs
-        s = pd.to_numeric(df[c], errors='coerce')
-        # κράτα στήλες που έχουν αρκετά μη-NaN (~>=100)
-        if np.isfinite(s).sum() >= 100:
-            cols.append(c)
-    return cols
-
-# -------------------- Sheet -> curves --------------------
-def extract_curves_from_sheet(df_sheet, subject_label):
-    """
-    Επιστρέφει list of tuples: (subject, side, varname, curve)
-    """
-    # Αν υπάρχει στήλη χρόνου, τη χρησιμοποιούμε μόνο για ταξινόμηση
-    time_cols = [c for c in df_sheet.columns if is_time_column(c)]
-    if time_cols:
-        first_t = time_cols[0]
+    vals = list(row_values)
+    # άσε το πρώτο κελί (συνήθως όνομα), ψάξε από 2ο και μετά
+    arr = []
+    for x in vals[1:]:
         try:
-            df_sheet = df_sheet.sort_values(by=first_t, kind='mergesort')
+            fx = float(x)
+            arr.append(fx)
         except Exception:
-            pass
+            arr.append(np.nan)
+    arr = np.asarray(arr, dtype=float)
 
-    candidates = pick_timeseries_columns(df_sheet)
-    curves = []
-    for c in candidates:
-        var = normalize_var(c)
-        if var is None:
+    # ψάξε το μεγαλύτερο συνεχόμενο διάστημα με >=900 finite samples
+    isn = np.isfinite(arr)
+    if not isn.any():
+        return None
+    # βρες όλα τα segments finite
+    max_len = 0; best = None
+    i = 0
+    while i < len(arr):
+        if not np.isfinite(arr[i]):
+            i += 1; continue
+        j = i
+        while j < len(arr) and np.isfinite(arr[j]):
+            j += 1
+        seg = arr[i:j]
+        if seg.size > max_len:
+            max_len = seg.size
+            best = seg
+        i = j
+    if best is None or best.size < 900:
+        return None
+    # ιδανικά θέλουμε 1001 — αν >1001 κόψε, αν <1001 κάνε padding (σπάνια)
+    if best.size >= 1001:
+        return best[:1001]
+    # padding (γραμμικό), αν χρειαστεί
+    pad = np.full(1001, np.nan, dtype=float)
+    pad[:best.size] = best
+    # (προαιρετικά interpolation, εδώ αφήνουμε NaN στο τέλος)
+    return pad
+
+def parse_sheet_rowwise(df_sheet):
+    """
+    Προσπάθεια parsing όταν το sheet είναι σε μορφή:
+      [0] variable name | [1..] 1001 samples
+    Επιστρέφει λίστα dicts: {'raw_name','side','variable','curve'}
+    """
+    rows = []
+    # ρίξε εντελώς κενές στήλες
+    df = df_sheet.copy()
+    if df.empty:
+        return rows
+
+    # βρες rows με πιθανή μεταβλητή: η 1η στήλη string & >=900 αριθμητικές μετά
+    first_col = df.columns[0]
+    for idx, r in df.iterrows():
+        name_cell = str(r[first_col]) if first_col in df.columns else ''
+        if name_cell is None or name_cell.strip()=='' or name_cell.lower().startswith('nan'):
             continue
-        side = detect_side(c) or 'B'  # αν δεν βρεθεί πλευρά → 'B' (both/unspecified)
-        s = pd.to_numeric(df_sheet[c], errors='coerce').to_numpy(dtype=float)
-        # καθάρισε NaN στην αρχή/τέλος
-        if np.isfinite(s).sum() < 50:
-            continue
-        # αν έχει περισσότερα από 1001, κόψε/παρε 1001
-        if s.size > 1001:
-            s = s[:1001]
-        # αν έχει λιγότερα, κάνε simple linear interp σε 1001
-        if s.size < 1001:
-            x_old = np.linspace(0, 1, s.size)
-            x_new = np.linspace(0, 1, 1001)
-            s = np.interp(x_new, x_old, np.nan_to_num(s, nan=np.nanmean(s[np.isfinite(s)]) if np.isfinite(s).any() else 0.0))
-        curves.append((subject_label, side, var, s))
-    return curves
+        # απόπειρα εξαγωγής πλευράς & variable
+        side = detect_side_from_text(name_cell)
+        var  = detect_variable_from_text(name_cell)
 
-# -------------------- Main processing --------------------
-def process_xlsx(xlsx_path, out_root, label_prefix=None):
-    ensure_dir(out_root)
-    # Διάβασε ΟΛΑ τα sheets
-    all_sheets = pd.read_excel(xlsx_path, sheet_name=None, engine='openpyxl')
-    results = []
+        vals = row_to_numeric_values(list(r.values))
+        if vals is None:
+            continue  # όχι “γραμμή-σήμα”
 
-    for sheet_name, df in all_sheets.items():
-        # subject id από όνομα καρτέλας (π.χ. Sub01 -> 1), αλλιώς φύλα το raw
-        m = re.search(r'(\d+)', str(sheet_name))
-        if m:
-            subj_id = int(m.group(1))
-            subj_label = f"sub{subj_id:03d}"
-        else:
-            subj_label = f"sub_{re.sub(r'[^A-Za-z0-9]+','', sheet_name)}"
-        if label_prefix:
-            subj_label = f"{label_prefix}_{subj_label}"
+        # αν δεν βρήκα side από το κείμενο και η μεταβλητή είναι joint/GRF/EMG,
+        # προσπάθησε να μαντέψεις: αν υπάρχει “Left/Right” σε διπλανές γραμμές
+        rows.append({
+            'raw_name': name_cell.strip(),
+            'side': side,
+            'variable': var,
+            'curve': vals
+        })
+    return rows
 
-        outdir = os.path.join(out_root, subj_label)
-        ensure_dir(outdir)
+# -------------------- main per-sheet → subject processing --------------------
 
-        curves = extract_curves_from_sheet(df, subj_label)
-        if not curves:
-            # αν δεν βρέθηκαν καμπύλες, γράψε debug
-            with open(os.path.join(outdir, f"{subj_label}_DEBUG.txt"), "w") as f:
-                f.write("Columns:\n" + "\n".join(map(str, df.columns)))
-            continue
+def process_sheet(subject_name, df_sheet, out_dir, label_prefix):
+    """
+    Παίρνει ένα pandas sheet, κάνει parsing (row-wise),
+    παράγει CSV/PNG και per-subject summary.
+    """
+    ensure_dir(out_dir)
+    parsed = parse_sheet_rowwise(df_sheet)
 
-        # Για κάθε καμπύλη: σώσε CSV, PH, PNG, summary row
-        for (_sub, side, var, s) in curves:
-            var_id = re.sub(r'[^A-Za-z0-9_]+','', var)
-            side_id = re.sub(r'[^A-Za-z0-9]+','', side)
-            base = os.path.join(outdir, f"{subj_label}_{side_id}_{var_id}")
-            # CSV
-            save_curve_long(s, _sub, side, var, base + ".csv")
-            # PH
+    # Αν δεν βρήκαμε τίποτα, γράψε DEBUG για να δούμε columns & head
+    if not parsed:
+        dbg = os.path.join(out_dir, f"{label_prefix}_{subject_name}_DEBUG.txt")
+        with open(dbg, "w") as f:
+            f.write("No row-wise signals parsed.\n")
+            f.write("Columns:\n")
+            f.write("\n".join(map(str, df_sheet.columns)) + "\n\n")
+            f.write("Head(10):\n")
             try:
-                X = takens_embedding(s, m=8, tau=5)
-                dgm1 = ripser_h1_diagram(X)
-                save_pd_and_barcode(dgm1, base, title=f"{subj_label} {side} {var}")
-                tot_pers = float(np.nansum(np.clip(dgm1[:,1]-dgm1[:,0], 0, None))) if dgm1.size else 0.0
-                results.append({
-                    'subject': _sub,
-                    'side': side,
-                    'variable': var,
-                    'h1_points': int(dgm1.shape[0]),
-                    'h1_total_persistence': tot_pers
-                })
-            except Exception as e:
-                results.append({
-                    'subject': _sub,
-                    'side': side,
-                    'variable': var,
-                    'error': str(e)
-                })
+                f.write(df_sheet.head(10).to_string())
+            except Exception:
+                pass
+        return 0
 
-        # per-subject summary
-        subj_rows = [r for r in results if r['subject'] == subj_label]
-        if subj_rows:
-            pd.DataFrame(subj_rows).to_csv(os.path.join(outdir, f"{subj_label}_summary.csv"), index=False)
+    # Αν υπάρχουν μεταβλητές χωρίς side, προσπαθώ να τις ζευγαρώσω:
+    # π.χ. αν δύο raw_names για “HipAngles …” στη σειρά, βάλε L/R με τη σειρά εμφάνισης.
+    by_var = {}
+    for it in parsed:
+        var = it['variable'] or slug(it['raw_name'])
+        by_var.setdefault(var, []).append(it)
+    # συμπλήρωσε sides
+    for var, lst in by_var.items():
+        # αν όλα έχουν side -> OK
+        if all(x['side'] in ['L','R','P','N'] for x in lst):
+            continue
+        # αλλιώς, δώσε L,R με τη σειρά εμφάνισης
+        lr = ['L','R']
+        pn = ['P','N']
+        # heuristic: joint/GRF -> L/R, stroke EMG ίσως P/N, αλλά θα βάλουμε L/R για γενικότητα
+        seq = lr
+        i = 0
+        for x in lst:
+            if x['side'] not in ['L','R','P','N',None]:
+                x['side'] = None
+            if x['side'] is None:
+                x['side'] = seq[i % len(seq)]
+                i += 1
 
-    # merged summary
-    if results:
-        pd.DataFrame(results).to_csv(os.path.join(out_root, "all_subjects_summary.csv"), index=False)
-    print(f"[DONE] Wrote output -> {os.path.abspath(out_root)}")
+    # Γράψε outputs
+    import matplotlib
+    matplotlib.use('Agg')
+
+    summary_rows = []
+    subj_id_num = re.search(r'(\d+)', subject_name)
+    subj_id = int(subj_id_num.group(1)) if subj_id_num else subject_name
+
+    for it in parsed:
+        side = it['side'] or 'U'  # Unknown
+        var  = it['variable'] or slug(it['raw_name'])
+        curve = it['curve']
+        # σώσε CSV
+        out_prefix = os.path.join(out_dir, f"{label_prefix}_sub{subj_id:03d}_{side}_{var}")
+        save_curve_csv(curve, subj_id, side, var, out_prefix + ".csv")
+
+        # PH
+        X = takens_embedding(curve, m=8, tau=5)
+        dgm1 = ripser_h1(X)
+        save_pd_and_barcode(dgm1, out_prefix, f"{label_prefix} Sub{subj_id:03d} {side} {var}")
+        total_persistence = float(np.nansum(np.clip(dgm1[:,1]-dgm1[:,0], 0, None))) if dgm1.size else 0.0
+
+        summary_rows.append({
+            'subject': subj_id,
+            'side': side,
+            'variable': var,
+            'h1_points': int(dgm1.shape[0]),
+            'h1_total_persistence': total_persistence
+        })
+
+    # per-subject summary
+    if summary_rows:
+        sdf = pd.DataFrame(summary_rows)
+        sdf.to_csv(os.path.join(out_dir, f"{label_prefix}_sub{subj_id:03d}_summary.csv"), index=False)
+
+    return len(summary_rows)
+
+# -------------------- driver --------------------
+
+def process_xlsx(xlsx_path, out_root, label_prefix='post'):
+    import openpyxl
+    ensure_dir(out_root)
+
+    xls = pd.ExcelFile(xlsx_path, engine='openpyxl')
+    sheets = [s for s in xls.sheet_names if str(s).strip()]
+    merged = []
+
+    for sname in sheets:
+        # αγνόησε tabs που δεν είναι subjects (π.χ. “Read me”)
+        if not re.search(r'\bsub\s*\d+\b', str(sname).lower()):
+            # ωστόσο, πολλά φύλλα είναι "Sub01" ακριβώς—θα κρατήσουμε ό,τι ξεκινά με 'Sub'
+            if not str(sname).lower().startswith('sub'):
+                continue
+
+        df_s = pd.read_excel(xls, sheet_name=sname, header=0)
+        out_dir = os.path.join(out_root, f"{label_prefix}_{slug(sname)}")
+        n = process_sheet(str(sname), df_s, out_dir, label_prefix=label_prefix)
+
+        # μάζεψε per-subject summary αν υπάρχει
+        summ = os.path.join(out_dir, f"{label_prefix}_{slug(sname)}_summary.csv")
+        if os.path.exists(summ):
+            m = pd.read_csv(summ)
+            merged.append(m)
+
+    # merged all_subjects_summary
+    if merged:
+        all_df = pd.concat(merged, ignore_index=True)
+        all_df.to_csv(os.path.join(out_root, "all_subjects_summary.csv"), index=False)
+
+    print(f"[DONE] Wrote output -> {out_root}")
+
+# -------------------- CLI --------------------
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--xlsx', required=True, help='Path στο Excel (xlsx)')
+    ap.add_argument('--xlsx', required=True, help='Excel αρχείο (.xlsx)')
     ap.add_argument('--out', required=True, help='Φάκελος εξόδου')
-    ap.add_argument('--label_prefix', default=None, help='Πρόθεμα για labels (π.χ. post / healthy)')
+    ap.add_argument('--label_prefix', default='post', help='Prefix: post | healthy (μπαίνει στα ονόματα αρχείων)')
     args = ap.parse_args()
 
     process_xlsx(args.xlsx, args.out, label_prefix=args.label_prefix)
