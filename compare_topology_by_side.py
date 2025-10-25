@@ -3,30 +3,17 @@
 """
 compare_topology_by_side.py
 ------------------------------------------
-Side-aware σύγκριση τοπολογικών H1 metrics.
+Side-aware σύγκριση post-stroke (P/N) έναντι healthy (B) για H1 total persistence.
 
-Τι κάνει
-- Φορτώνει 2 summaries (post-stroke & healthy) από το xlsx_to_ph.py.
-- Δεν ενοποιεί τα sides: κρατά P/N (post) και L/R (healthy).
-- Για ΚΑΘΕ variable:
-    * POST: P vs N (paired όπου υπάρχει ίδιο subject με P & N)
-    * HEALTHY: L vs R (paired όπου υπάρχει ίδιο subject με L & R)
-- Επιπλέον CROSS-GROUP ανά side:
-    * post P vs healthy L, post P vs healthy R,
-      post N vs healthy L, post N vs healthy R (unpaired tests).
-- Metrics:
-    - means/SD/N ανά side
-    - paired t-test, Wilcoxon (για εντός-ομάδας)
-    - Welch t-test, Mann–Whitney (για μεταξύ-ομάδων)
-    - Effect sizes: Cohen’s dz (paired), Cohen’s d (unpaired), Cliff’s delta
-- Plots: boxplot + violin για κάθε σύγκριση.
-- Αποτέλεσμα: side_stats.csv (εντός-ομάδων) + cross_side_stats.csv (μεταξύ-ομάδων) + PNGs.
+Είσοδοι:
+  --post    : CSV all_subjects_summary από post-stroke export
+  --healthy : CSV all_subjects_summary από healthy export
+  --out     : φάκελος εξόδου
 
-Χρήση:
-  python compare_topology_by_side.py \
-      --post    ~/topology/out_post_xlsx_col/all_subjects_summary.csv \
-      --healthy ~/topology/out_healthy_xlsx_col/all_subjects_summary.csv \
-      --out     ~/topology/compare_by_side
+Παράγει:
+  - group_stats_by_side.csv (όλες οι συγκρίσεις ανά variable_base)
+  - raw_*.csv (raw τιμές ανά σύγκριση)
+  - box_*.png, violin_*.png (plots ανά σύγκριση)
 """
 
 import argparse, os, re
@@ -34,49 +21,33 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import stats
+from statsmodels.stats.multitest import multipletests
 
 # ------------------------------ helpers ------------------------------
 
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 
-def normalize_variable_name(v):
-    """Αφαιρεί pside_/nside_ prefixes ώστε να ταιριάξει με healthy ονόματα."""
-    v = str(v).strip()
-    v_low = v.lower()
-    if v_low.startswith('pside_'):
-        return v[len('pside_'):]
-    if v_low.startswith('nside_'):
-        return v[len('nside_'):]
+def sanitize_subject_label(s):
+    s = str(s)
+    m = re.search(r'(\d+)', s)
+    if m:
+        return f"sub{int(m.group(1)):03d}"
+    return re.sub(r'[^A-Za-z0-9]+','', s)
+
+def normalize_variable_base(varname: str) -> str:
+    """
+    Ενώνει ονοματοδοσίες:
+      post:  pside_gasnorm / nside_gasnorm / AnkleAngles_x / ...
+      healthy: gasnorm / AnkleAngles_x / ...
+    Επιστρέφει κοινή "βάση" μεταβλητής για συγκρίσεις.
+    """
+    v = str(varname).strip().lower()
+    # αφαίρεσε prefixes pside_/nside_/bside_ αν υπάρχουν
+    v = re.sub(r'^(pside_|nside_|bside_)', '', v)
     return v
 
-def read_summary(path, group_label):
-    df = pd.read_csv(path)
-    df['group'] = group_label
-    if 'h1_total_persistence' not in df.columns:
-        raise ValueError(f"{path}: λείπει η στήλη h1_total_persistence")
-    df['h1_total_persistence'] = pd.to_numeric(df['h1_total_persistence'], errors='coerce')
-    df = df[df['h1_total_persistence'].notna()].copy()
-    # normalize subject id (για pairing)
-    df['subject_norm'] = df['subject'].astype(str).str.extract(r'(\d+)')
-    df['subject_norm'] = df['subject_norm'].fillna(df['subject'].astype(str))
-    df['subject_norm'] = df['subject_norm'].apply(
-        lambda s: f"sub{int(s):03d}" if str(s).isdigit() else re.sub(r'[^A-Za-z0-9]+','', str(s))
-    )
-    # normalized variable (για cross-group match)
-    df['variable_base'] = df['variable'].apply(normalize_variable_name)
-    return df
-
-def cohens_dz_paired(x, y):
-    x = np.asarray(x, float); y = np.asarray(y, float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    d = x[mask] - y[mask]
-    if d.size < 2: return np.nan
-    sd = np.std(d, ddof=1)
-    if sd == 0 or not np.isfinite(sd): return np.nan
-    return float(np.mean(d) / sd)
-
-def cohens_d_unpaired(a, b):
-    a = np.asarray(a, float); b = np.asarray(b, float)
+def cohens_d(a, b):
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
     a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
     if len(a) < 2 or len(b) < 2: return np.nan
     na, nb = len(a), len(b)
@@ -85,10 +56,10 @@ def cohens_d_unpaired(a, b):
     if denom <= 0: return np.nan
     s = np.sqrt(((na-1)*va + (nb-1)*vb) / denom)
     if s == 0 or not np.isfinite(s): return np.nan
-    return float((np.mean(a) - np.mean(b)) / s)
+    return (np.mean(a) - np.mean(b)) / s
 
 def cliffs_delta(a, b):
-    a = np.asarray(a, float); b = np.asarray(b, float)
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
     a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
     if len(a) == 0 or len(b) == 0: return np.nan
     n_conc = 0; n_disc = 0
@@ -97,19 +68,42 @@ def cliffs_delta(a, b):
         n_disc += np.sum(x < b)
     return float((n_conc - n_disc) / (len(a)*len(b)))
 
-def simple_boxplot(two_arrays, labels, title, out_png):
+def welch_ttest(a, b):
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if len(a) < 2 or len(b) < 2:
+        return np.nan, np.nan
+    t, p = stats.ttest_ind(a, b, equal_var=False)
+    return float(t), float(p)
+
+def mannwhitney(a, b):
+    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
+    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
+    if len(a) < 1 or len(b) < 1:
+        return np.nan, np.nan
+    try:
+        u, p = stats.mannwhitneyu(a, b, alternative='two-sided')
+        return float(u), float(p)
+    except Exception:
+        return np.nan, np.nan
+
+def boxplot_two(a, b, labels, title, out_png):
+    if len(a) == 0 or len(b) == 0:
+        return
     plt.figure()
-    data = [np.asarray(a, float) for a in two_arrays]
-    plt.boxplot(data, tick_labels=labels, showfliers=True)  # Matplotlib 3.9+: tick_labels
+    data = [np.asarray(a, float), np.asarray(b, float)]
+    plt.boxplot(data, labels=labels, showfliers=True)
     plt.ylabel("H1 total persistence")
     plt.title(title)
     plt.tight_layout()
     plt.savefig(out_png, dpi=150, bbox_inches='tight')
     plt.close()
 
-def violin_plot(two_arrays, labels, title, out_png):
+def violin_two(a, b, labels, title, out_png):
+    if len(a) == 0 or len(b) == 0:
+        return
     plt.figure()
-    data = [np.asarray(a, float) for a in two_arrays]
+    data = [np.asarray(a, float), np.asarray(b, float)]
     plt.violinplot(data, showmeans=True, showextrema=False)
     plt.xticks([1,2], labels)
     plt.ylabel("H1 total persistence")
@@ -118,107 +112,51 @@ def violin_plot(two_arrays, labels, title, out_png):
     plt.savefig(out_png, dpi=150, bbox_inches='tight')
     plt.close()
 
-def paired_arrays(df, side_a, side_b):
-    piv = df.pivot_table(index='subject_norm', columns='side', values='h1_total_persistence', aggfunc='mean')
-    if side_a not in piv.columns or side_b not in piv.columns:
-        return np.array([]), np.array([])
-    sub = piv.dropna(subset=[side_a, side_b])
-    return sub[side_a].to_numpy(float), sub[side_b].to_numpy(float)
+def aggregate_post(df_post):
+    """
+    Επιστρέφει δύο πίνακες:
+      post_P: per-subject ανά variable_base (μόνο side=P)
+      post_N: per-subject ανά variable_base (μόνο side=N)
+    """
+    d = df_post.copy()
+    d['variable_base'] = d['variable'].map(normalize_variable_base)
+    d['h1_total_persistence'] = pd.to_numeric(d['h1_total_persistence'], errors='coerce')
+    d = d[d['h1_total_persistence'].notna()]
+    d['subject_norm'] = d['subject'].map(sanitize_subject_label)
 
-def side_stats_block(df, side_a, side_b, label_a, label_b, out_dir, var, group_tag):
-    # περιγραφικά ανά side (ανεξάρτητα)
-    def desc_for_side(side_code):
-        vals = df.loc[df['side']==side_code, 'h1_total_persistence'].astype(float).to_numpy()
-        vals = vals[np.isfinite(vals)]
-        return float(np.nanmean(vals)) if vals.size else np.nan, \
-               float(np.nanstd(vals, ddof=1)) if vals.size>1 else np.nan, \
-               int(vals.size), vals
+    post_P = d[d['side'].astype(str).str.upper()=='P'].groupby(
+        ['subject_norm','variable_base'], as_index=False
+    )['h1_total_persistence'].mean()
 
-    meanA, sdA, nA, vals_a = desc_for_side(side_a)
-    meanB, sdB, nB, vals_b = desc_for_side(side_b)
+    post_N = d[d['side'].astype(str).str.upper()=='N'].groupby(
+        ['subject_norm','variable_base'], as_index=False
+    )['h1_total_persistence'].mean()
 
-    # paired tests
-    x, y = paired_arrays(df, side_a, side_b)
-    if x.size >= 2:
-        t_stat, p_t = stats.ttest_rel(x, y, alternative='two-sided')
-        try:
-            w_stat, p_w = stats.wilcoxon(x, y, alternative='two-sided', zero_method='wilcox')
-        except Exception:
-            w_stat, p_w = (np.nan, np.nan)
-        dz = cohens_dz_paired(x, y)
-        cd = cliffs_delta(x, y)  # σε μη-paired εκδοχή, εδώ είναι επί των ζευγών – αποδεκτό ως ένδειξη
-    else:
-        t_stat = p_t = w_stat = p_w = dz = cd = np.nan
+    return post_P, post_N
 
-    # plots
-    safe_var = re.sub(r'[^A-Za-z0-9_]+','', str(var))
-    base = f"{group_tag}_{safe_var}_{label_a}_vs_{label_b}"
-    box_png    = os.path.join(out_dir, f"box_{base}.png")
-    violin_png = os.path.join(out_dir, f"violin_{base}.png")
-    simple_boxplot([vals_a, vals_b], [label_a, label_b], title=f"{group_tag} — {var}: {label_a} vs {label_b}", out_png=box_png)
-    violin_plot([vals_a, vals_b], [label_a, label_b], title=f"{group_tag} — {var}: {label_a} vs {label_b}", out_png=violin_png)
+def aggregate_healthy(df_healthy):
+    """
+    Healthy: οι τιμές είναι ήδη B (ή ανά subject). Παίρνουμε per-subject
+    mean ανά variable_base.
+    """
+    d = df_healthy.copy()
+    d['variable_base'] = d['variable'].map(normalize_variable_base)
+    d['h1_total_persistence'] = pd.to_numeric(d['h1_total_persistence'], errors='coerce')
+    d = d[d['h1_total_persistence'].notna()]
+    d['subject_norm'] = d['subject'].map(sanitize_subject_label)
 
-    return {
-        'group': group_tag,
-        'variable': var,
-        'sideA_label': label_a, 'sideB_label': label_b,
-        'mean_A': meanA, 'sd_A': sdA, 'n_A': int(nA),
-        'mean_B': meanB, 'sd_B': sdB, 'n_B': int(nB),
-        'paired_N': int(x.size),
-        'paired_t_stat': float(t_stat) if np.isfinite(t_stat) else np.nan,
-        'paired_t_pvalue': float(p_t) if np.isfinite(p_t) else np.nan,
-        'wilcoxon_stat': float(w_stat) if np.isfinite(w_stat) else np.nan,
-        'wilcoxon_pvalue': float(p_w) if np.isfinite(p_w) else np.nan,
-        'cohens_dz': float(dz) if np.isfinite(dz) else np.nan,
-        'cliffs_delta_on_pairs': float(cd) if np.isfinite(cd) else np.nan,
-        'boxplot_png': os.path.basename(box_png),
-        'violin_png':  os.path.basename(violin_png),
-    }
+    healthy_B = d.groupby(
+        ['subject_norm','variable_base'], as_index=False
+    )['h1_total_persistence'].mean()
 
-def cross_group_block(df_post, df_hlt, var_base, post_side, hlt_side, out_dir):
-    """Μεταξύ-ομάδων (unpaired) για συγκεκριμένο variable_base & sides."""
-    sub_post = df_post[(df_post['variable_base']==var_base) & (df_post['side']==post_side)]
-    sub_hlt  = df_hlt [(df_hlt ['variable_base']==var_base) & (df_hlt ['side']==hlt_side)]
-    a = sub_post['h1_total_persistence'].astype(float).to_numpy()
-    b = sub_hlt ['h1_total_persistence'].astype(float).to_numpy()
-    a = a[np.isfinite(a)]; b = b[np.isfinite(b)]
-    meanA, sdA, nA = (np.nan, np.nan, 0) if a.size==0 else (float(np.nanmean(a)), float(np.nanstd(a, ddof=1)) if a.size>1 else np.nan, int(a.size))
-    meanB, sdB, nB = (np.nan, np.nan, 0) if b.size==0 else (float(np.nanmean(b)), float(np.nanstd(b, ddof=1)) if b.size>1 else np.nan, int(b.size))
-    if a.size>=2 and b.size>=2:
-        t_stat, p_t = stats.ttest_ind(a, b, equal_var=False)
-        try:
-            u_stat, p_u = stats.mannwhitneyu(a, b, alternative='two-sided')
-        except Exception:
-            u_stat, p_u = (np.nan, np.nan)
-        d  = cohens_d_unpaired(a, b)
-        cd = cliffs_delta(a, b)
-    else:
-        t_stat = p_t = u_stat = p_u = d = cd = np.nan
+    return healthy_B
 
-    # plots
-    safe_var = re.sub(r'[^A-Za-z0-9_]+','', str(var_base))
-    base = f"cross_{safe_var}_post{post_side}_vs_healthy{hlt_side}"
-    box_png    = os.path.join(out_dir, f"box_{base}.png")
-    violin_png = os.path.join(out_dir, f"violin_{base}.png")
-    simple_boxplot([a, b], [f"post-{post_side}", f"healthy-{hlt_side}"],
-                   title=f"CROSS {var_base}: post-{post_side} vs healthy-{hlt_side}", out_png=box_png)
-    violin_plot([a, b], [f"post-{post_side}", f"healthy-{hlt_side}"],
-                title=f"CROSS {var_base}: post-{post_side} vs healthy-{hlt_side}", out_png=violin_png)
-
-    return {
-        'variable_base': var_base,
-        'post_side': post_side, 'healthy_side': hlt_side,
-        'mean_post': meanA, 'sd_post': sdA, 'n_post': int(nA),
-        'mean_healthy': meanB, 'sd_healthy': sdB, 'n_healthy': int(nB),
-        'welch_t_stat': float(t_stat) if np.isfinite(t_stat) else np.nan,
-        'welch_t_pvalue': float(p_t) if np.isfinite(p_t) else np.nan,
-        'mannwhitney_u': float(u_stat) if np.isfinite(u_stat) else np.nan,
-        'mannwhitney_pvalue': float(p_u) if np.isfinite(p_u) else np.nan,
-        'cohens_d': float(d) if np.isfinite(d) else np.nan,
-        'cliffs_delta': float(cd) if np.isfinite(cd) else np.nan,
-        'boxplot_png': os.path.basename(box_png),
-        'violin_png':  os.path.basename(violin_png),
-    }
+def collect_values(agg_df, var):
+    """Επιστρέφει numpy array τιμών για συγκεκριμένο variable_base."""
+    sub = agg_df[agg_df['variable_base']==var]['h1_total_persistence'].astype(float).to_numpy()
+    # ρίξε NaN
+    sub = sub[np.isfinite(sub)]
+    return sub
 
 # ------------------------------ main ------------------------------
 
@@ -231,64 +169,109 @@ def main():
 
     ensure_dir(args.out)
 
-    df_post    = read_summary(args.post,    'post')
-    df_healthy = read_summary(args.healthy, 'healthy')
+    # Φόρτωση
+    post = pd.read_csv(args.post)
+    healthy = pd.read_csv(args.healthy)
 
-    # ---------- ΕΝΤΟΣ-ΟΜΑΔΑΣ ----------
-    rows_within = []
+    # Aggregations
+    post_P, post_N = aggregate_post(post)
+    healthy_B      = aggregate_healthy(healthy)
 
-    # POST: P vs N
-    post_vars = sorted(df_post['variable'].unique())
-    for var in post_vars:
-        sub = df_post[df_post['variable'] == var].copy()
-        if sub.empty or 'side' not in sub.columns:
-            continue
-        sub = sub[sub['side'].isin(['P','N'])]
-        if sub.empty:
-            continue
-        rows_within.append(
-            side_stats_block(
-                df=sub, side_a='P', side_b='N',
-                label_a='P (paretic)', label_b='N (non-paretic)',
-                out_dir=args.out, var=var, group_tag='post'
-            )
-        )
+    # Κοινές μεταβλητές (επί της βάσης)
+    vars_post = set(post_P['variable_base']).union(set(post_N['variable_base']))
+    vars_hlt  = set(healthy_B['variable_base'])
+    common_vars = sorted(vars_post.intersection(vars_hlt))
+    if not common_vars:
+        print("[ERROR] Δεν βρέθηκαν κοινές μεταβλητές.")
+        return
 
-    # HEALTHY: L vs R
-    healthy_vars = sorted(df_healthy['variable'].unique())
-    for var in healthy_vars:
-        sub = df_healthy[df_healthy['variable'] == var].copy()
-        if sub.empty or 'side' not in sub.columns:
-            continue
-        sub = sub[sub['side'].isin(['L','R'])]
-        if sub.empty:
-            continue
-        rows_within.append(
-            side_stats_block(
-                df=sub, side_a='L', side_b='R',
-                label_a='L', label_b='R',
-                out_dir=args.out, var=var, group_tag='healthy'
-            )
-        )
+    rows = []
+    p_all = []  # για FDR
+    which_test = []  # 't' ή 'u' για να αποθηκεύσουμε ξεχωριστά
 
-    pd.DataFrame(rows_within).to_csv(os.path.join(args.out, "side_stats.csv"), index=False)
+    def one_comparison(values_a, values_b, label_a, label_b, var, tag):
+        """Τρέχει όλα τα stats & plots για ένα ζεύγος groups."""
+        a = np.asarray(values_a, float); a = a[np.isfinite(a)]
+        b = np.asarray(values_b, float); b = b[np.isfinite(b)]
+        n_a, n_b = len(a), len(b)
 
-    # ---------- ΜΕΤΑΞΥ-ΟΜΑΔΩΝ (CROSS) ----------
-    rows_cross = []
-    # κοινές base-μεταβλητές (μετά το strip pside_/nside_)
-    common_bases = sorted(set(df_post['variable_base']).intersection(set(df_healthy['variable_base'])))
-    for vb in common_bases:
-        for ps in ['P','N']:
-            for hs in ['L','R']:
-                rows_cross.append(
-                    cross_group_block(df_post, df_healthy, vb, ps, hs, args.out)
-                )
+        # περιγραφικά
+        mean_a = float(np.nanmean(a)) if n_a else np.nan
+        std_a  = float(np.nanstd(a, ddof=1)) if n_a>1 else np.nan
+        mean_b = float(np.nanmean(b)) if n_b else np.nan
+        std_b  = float(np.nanstd(b, ddof=1)) if n_b>1 else np.nan
 
-    pd.DataFrame(rows_cross).to_csv(os.path.join(args.out, "cross_side_stats.csv"), index=False)
+        # tests
+        t_stat, p_t = welch_ttest(a, b)
+        u_stat, p_u = mannwhitney(a, b)
+        d  = cohens_d(a, b)
+        cd = cliffs_delta(a, b)
 
-    print(f"[DONE] Wrote: {os.path.join(args.out, 'side_stats.csv')}")
-    print(f"[DONE] Wrote: {os.path.join(args.out, 'cross_side_stats.csv')}")
-    print(f"[DONE] Plots in: {os.path.abspath(args.out)}")
+        # raw dumps
+        safe_var = re.sub(r'[^A-Za-z0-9_]+','', str(var))
+        comp_id  = f"{tag}_{safe_var}_{label_a}_vs_{label_b}"
+        pd.DataFrame({'group':label_a,'value':a}).to_csv(os.path.join(args.out, f'raw_{comp_id}_{label_a}.csv'), index=False)
+        pd.DataFrame({'group':label_b,'value':b}).to_csv(os.path.join(args.out, f'raw_{comp_id}_{label_b}.csv'), index=False)
+
+        # plots (παράλειψη αν λείπει κάποιο group)
+        box_png   = os.path.join(args.out, f"box_{comp_id}.png")
+        violin_png= os.path.join(args.out, f"violin_{comp_id}.png")
+        boxplot_two(a, b, [label_a, label_b], title=f"{tag} — {var}: {label_a} vs {label_b}", out_png=box_png)
+        violin_two(a, b, [label_a, label_b], title=f"{tag} — {var}: {label_a} vs {label_b}", out_png=violin_png)
+
+        # καταγραφή
+        rows.append({
+            'variable_base': var,
+            'comparison': f"{tag}: {label_a} vs {label_b}",
+            'n_'+label_a: int(n_a), 'mean_'+label_a: mean_a, 'std_'+label_a: std_a,
+            'n_'+label_b: int(n_b), 'mean_'+label_b: mean_b, 'std_'+label_b: std_b,
+            'welch_t_stat': t_stat, 'welch_t_pvalue': p_t,
+            'mannwhitney_u': u_stat, 'mannwhitney_pvalue': p_u,
+            'cohens_d': d, 'cliffs_delta': cd,
+            'boxplot_png': os.path.basename(box_png) if n_a and n_b else '',
+            'violin_png':  os.path.basename(violin_png) if n_a and n_b else ''
+        })
+        p_all.append(p_t); which_test.append('t')
+        p_all.append(p_u); which_test.append('u')
+
+    # Τρέξε συγκρίσεις για κάθε κοινή μεταβλητή
+    for var in common_vars:
+        vals_P = collect_values(post_P, var)
+        vals_N = collect_values(post_N, var)
+        vals_B = collect_values(healthy_B, var)
+
+        # 1) P vs N (μόνο αν υπάρχουν και τα δύο)
+        if len(vals_P) > 0 and len(vals_N) > 0:
+            one_comparison(vals_P, vals_N, 'P', 'N', var, tag='post')
+
+        # 2) P vs B
+        if len(vals_P) > 0 and len(vals_B) > 0:
+            one_comparison(vals_P, vals_B, 'P', 'B', var, tag='post_vs_healthy')
+
+        # 3) N vs B
+        if len(vals_N) > 0 and len(vals_B) > 0:
+            one_comparison(vals_N, vals_B, 'N', 'B', var, tag='post_vs_healthy')
+
+    # FDR (ξεχωριστά labels για t/u)
+    if p_all:
+        reject, qvals, _, _ = multipletests(p_all, method='fdr_bh')
+        # γράψε τα q-values πίσω κατά σειρά
+        qi = 0
+        for r in rows:
+            # γράφουμε q για t & u ξεχωριστά
+            if np.isfinite(r.get('welch_t_pvalue', np.nan)):
+                r['welch_t_qvalue'] = float(qvals[qi]); r['welch_t_reject_fdr05'] = bool(reject[qi]); qi += 1
+            else:
+                r['welch_t_qvalue'] = np.nan; r['welch_t_reject_fdr05'] = False
+            if np.isfinite(r.get('mannwhitney_pvalue', np.nan)):
+                r['mannwhitney_qvalue'] = float(qvals[qi]); r['mannwhitney_reject_fdr05'] = bool(reject[qi]); qi += 1
+            else:
+                r['mannwhitney_qvalue'] = np.nan; r['mannwhitney_reject_fdr05'] = False
+
+    out_csv = os.path.join(args.out, "group_stats_by_side.csv")
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    print(f"[DONE] Wrote: {out_csv}")
+    print(f"[DONE] Plots/raw in: {os.path.abspath(args.out)}")
 
 if __name__ == '__main__':
     main()
