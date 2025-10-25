@@ -9,7 +9,8 @@ compare_topology.py (patched)
   1) Ασφαλές dtype cast (astype(float).to_numpy()).
   2) Αποθήκευση raw τιμών ανά variable (CSV) για εύκολο replot/stats.
   3) Επιπλέον violin plots πέρα από boxplots.
-  4) Έλεγχος πολλαπλών συγκρίσεων (Benjamini–Hochberg FDR) για Welch-t και Mann–Whitney.
+  4) Έλεγχος πολλαπλών συγκρίσεων (Benjamini–Hochberg FDR) για Welch-t & Mann–Whitney.
+  5) ΕΝΟΠΟΙΗΣΗ ονομάτων μεταβλητών (strip pside_/nside_ κ.λπ.) ώστε να ταιριάζουν ομάδες.
 
 Χρήση:
   python compare_topology.py \
@@ -35,12 +36,36 @@ def read_summary(path, group_label):
     # περιμένουμε: subject, side, variable, h1_points, h1_total_persistence (ή error)
     return df
 
+# --- ομογενοποίηση subject id για ομαδοποίηση ανά άτομο ---
 def sanitize_subject_label(s):
     s = str(s)
     m = re.search(r'(\d+)', s)
     if m:
         return f"sub{int(m.group(1)):03d}"
     return re.sub(r'[^A-Za-z0-9]+','', s)
+
+# --- ΕΝΟΠΟΙΗΣΗ ονομάτων μεταβλητών ανά group ---
+def normalize_variable_name(v, group):
+    """
+    Επιστρέφει εναρμονισμένο όνομα μεταβλητής:
+    - Post-stroke: αφαιρεί prefixes πλευράς (pside_/nside_) για να ταιριάζει με healthy.
+    - Τα υπόλοιπα κρατιούνται ως έχουν (π.χ. ankleangles_x, pelvisangles, gasnorm, κ.λπ.).
+    """
+    v0 = str(v).strip().lower()
+    if group == 'post':
+        v0 = re.sub(r'^(pside_|nside_)', '', v0)  # strip side prefixes
+    # μπορούμε εδώ να περάσουμε και μικρούς χαρτογράφους αν χρειαστεί:
+    # mappings = {'hipanglesx':'hipangles_x', ...}
+    # v0 = mappings.get(v0, v0)
+    return v0
+
+def normalize_df_variables(df, group_label):
+    df = df.copy()
+    if 'variable' in df.columns:
+        df['variable'] = df['variable'].apply(lambda x: normalize_variable_name(x, group_label))
+    if 'subject' in df.columns:
+        df['subject'] = df['subject'].astype(str)
+    return df
 
 def aggregate_per_subject(df):
     """
@@ -100,7 +125,8 @@ def mannwhitney(a, b):
 def simple_boxplot(a, b, labels, title, out_png):
     plt.figure()
     data = [np.asarray(a, float), np.asarray(b, float)]
-    plt.boxplot(data, labels=labels, showfliers=True)
+    # Matplotlib 3.9+: χρησιμοποιούμε tick_labels αντί labels
+    plt.boxplot(data, tick_labels=labels, showfliers=True)
     plt.ylabel("H1 total persistence")
     plt.title(title)
     plt.tight_layout()
@@ -129,8 +155,9 @@ def main():
 
     ensure_dir(args.out)
 
-    df_post    = read_summary(args.post,    'post')
-    df_healthy = read_summary(args.healthy, 'healthy')
+    # διαβάζουμε & ενοποιούμε ονόματα μεταβλητών
+    df_post    = normalize_df_variables(read_summary(args.post,    'post'),    'post')
+    df_healthy = normalize_df_variables(read_summary(args.healthy, 'healthy'), 'healthy')
 
     # Aggregate per subject (mean across sides)
     ag_post    = aggregate_per_subject(df_post)
@@ -151,7 +178,7 @@ def main():
     pvals_u = []
 
     for var in common_vars:
-        a = ag_post.loc[ag_post['variable']==var, 'h1_total_persistence'].astype(float).to_numpy()   # (1)
+        a = ag_post.loc[ag_post['variable']==var, 'h1_total_persistence'].astype(float).to_numpy()
         b = ag_healthy.loc[ag_healthy['variable']==var, 'h1_total_persistence'].astype(float).to_numpy()
 
         # περιγραφικά
@@ -198,8 +225,7 @@ def main():
             rows[i]['welch_t_reject_fdr05'] = bool(rej_t[i])
             rows[i]['mannwhitney_reject_fdr05'] = bool(rej_u[i])
     except Exception:
-        # αν για κάποιο λόγο αποτύχει, αγνόησε τα q-values
-        pass
+        pass  # αν κάτι πάει στραβά, συνεχίζουμε χωρίς q-values
 
     out_csv = os.path.join(args.out, "group_stats.csv")
     pd.DataFrame(rows).to_csv(out_csv, index=False)
